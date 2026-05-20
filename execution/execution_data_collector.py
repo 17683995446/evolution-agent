@@ -43,6 +43,11 @@ class ExecutionDataCollector:
         self._retention_cycles = config.get("metrics_retention_cycles", 100)
         self._persist_path = config.get("metrics_persistence_path", "./workspace/metrics.json")
 
+        # 预计算统计（避免每次遍历）
+        self._total_executions = 0
+        self._total_success = 0
+        self._total_failures = 0
+
         # 订阅事件
         self._logging_svc.subscribe(self._on_event, filter_types=[
             EventType.TASK_COMPLETED,
@@ -68,6 +73,13 @@ class ExecutionDataCollector:
         with self._lock:
             self._metrics.append(metric)
             self._duration_history.append(result.duration)
+
+            # 更新预计算统计
+            self._total_executions += 1
+            if result.success:
+                self._total_success += 1
+            else:
+                self._total_failures += 1
 
             if not result.success and result.error:
                 error_key = metric.error_type or "unknown"
@@ -143,15 +155,13 @@ class ExecutionDataCollector:
             return self._metrics[-count:]
 
     def get_total_stats(self) -> Dict[str, Any]:
-        """获取全局统计概览"""
+        """获取全局统计概览（O(1)时间复杂度）"""
         with self._lock:
-            total = len(self._metrics)
-            success = sum(1 for m in self._metrics if m.success)
             return {
-                "total_executions": total,
-                "total_success": success,
-                "total_failures": total - success,
-                "overall_success_rate": success / total if total > 0 else 0.0,
+                "total_executions": self._total_executions,
+                "total_success": self._total_success,
+                "total_failures": self._total_failures,
+                "overall_success_rate": self._total_success / self._total_executions if self._total_executions > 0 else 0.0,
                 "avg_duration": self.get_average_duration(),
                 "total_cycles": len(self._cycle_summaries),
                 "error_types_count": len(self._error_registry),
@@ -168,8 +178,19 @@ class ExecutionDataCollector:
             if self._cycle_summaries:
                 cutoff_cycle = self._cycle_summaries[-1].cycle_number - max_cyc
                 original_len = len(self._metrics)
-                self._metrics = [m for m in self._metrics if m.cycle_number > cutoff_cycle]
+                
+                # 分离保留和移除的指标
+                kept_metrics = [m for m in self._metrics if m.cycle_number > cutoff_cycle]
+                removed_metrics = [m for m in self._metrics if m.cycle_number <= cutoff_cycle]
+                
+                self._metrics = kept_metrics
                 removed = original_len - len(self._metrics)
+                
+                # 重新计算预统计（仅基于保留的数据）
+                self._total_executions = len(self._metrics)
+                self._total_success = sum(1 for m in self._metrics if m.success)
+                self._total_failures = self._total_executions - self._total_success
+                
                 # 同步清理其他数据
                 self._duration_history = self._duration_history[-(len(self._metrics)):]
                 for key in list(self._error_registry.keys()):
