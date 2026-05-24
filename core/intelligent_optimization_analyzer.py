@@ -64,7 +64,7 @@ class IntelligentOptimizationAnalyzer:
         # 分析状态
         self._analysis_count: int = 0
         self._last_analysis_time: float = 0.0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # 配置
         self._min_cycles = config.get("min_cycles_for_analysis", 1)
@@ -96,18 +96,19 @@ class IntelligentOptimizationAnalyzer:
         # 采集分析数据
         insights = self._run_analysis(cycle_number, stats)
 
-        # 将洞察转化为规则
+        # 将洞察转化为规则（在锁保护下避免TOCTOU竞态）
         new_rules = []
-        for insight in insights:
-            rule = self._insight_to_rule(insight, cycle_number)
-            if rule:
-                # 检查是否已有类似规则
-                if not self._has_similar_rule(rule):
-                    self._rules.add_rule(rule)
-                    new_rules.append(rule)
-                    self._log.info(f"生成优化规则: [{rule.category.value}] {rule.name}")
-                else:
-                    self._log.debug(f"已存在类似规则，跳过: {rule.name}")
+        with self._lock:
+            for insight in insights:
+                rule = self._insight_to_rule(insight, cycle_number)
+                if rule:
+                    # 检查是否已有类似规则
+                    if not self._has_similar_rule(rule):
+                        self._rules.add_rule(rule)
+                        new_rules.append(rule)
+                        self._log.info(f"生成优化规则: [{rule.category.value}] {rule.name}")
+                    else:
+                        self._log.debug(f"已存在类似规则，跳过: {rule.name}")
 
         # 评估已有规则效果
         self._evaluate_existing_rules(cycle_number, stats)
@@ -128,13 +129,22 @@ class IntelligentOptimizationAnalyzer:
 
     def get_analysis_stats(self) -> Dict[str, Any]:
         """获取分析器统计"""
-        return {
-            "total_analyses": self._analysis_count,
-            "last_analysis_time": self._last_analysis_time,
-            "baseline_established": self._baseline_established,
-            "baseline_success_rate": self._baseline_success_rate,
-            "baseline_avg_duration": self._baseline_avg_duration,
-        }
+        with self._lock:
+            return {
+                "total_analyses": self._analysis_count,
+                "last_analysis_time": self._last_analysis_time,
+                "baseline_established": self._baseline_established,
+                "baseline_success_rate": self._baseline_success_rate,
+                "baseline_avg_duration": self._baseline_avg_duration,
+            }
+
+    def start(self) -> None:
+        """启动优化分析器"""
+        self._log.info("优化分析器已启动")
+
+    def stop(self) -> None:
+        """停止优化分析器"""
+        self._log.info("优化分析器已停止")
 
     # ── 分析策略 ──
 
@@ -164,14 +174,18 @@ class IntelligentOptimizationAnalyzer:
         insights = []
         current_rate = stats["overall_success_rate"]
 
-        if self._baseline_established:
+        with self._lock:
+            baseline_established = self._baseline_established
+            baseline_success_rate = self._baseline_success_rate
+
+        if baseline_established:
             # 与基线对比
-            if current_rate < self._baseline_success_rate - 0.1:
+            if current_rate < baseline_success_rate - 0.1:
                 insights.append(OptimizationInsight(
                     category=RuleCategory.QUALITY_IMPROVEMENT,
                     name="成功率下降告警",
-                    description=f"当前成功率({current_rate:.1%})显著低于基线({self._baseline_success_rate:.1%})",
-                    condition=f"success_rate < {self._baseline_success_rate - 0.05:.2f}",
+                    description=f"当前成功率({current_rate:.1%})显著低于基线({baseline_success_rate:.1%})",
+                    condition=f"success_rate < {baseline_success_rate - 0.05:.2f}",
                     action="增加任务前置校验步骤，失败任务快速重试",
                     priority=3,
                     confidence=0.8,
@@ -194,12 +208,16 @@ class IntelligentOptimizationAnalyzer:
         insights = []
         avg_duration = self._collector.get_average_duration()
 
-        if self._baseline_established and avg_duration > self._baseline_avg_duration * 1.5:
+        with self._lock:
+            baseline_established = self._baseline_established
+            baseline_avg_duration = self._baseline_avg_duration
+
+        if baseline_established and avg_duration > baseline_avg_duration * 1.5:
             insights.append(OptimizationInsight(
                 category=RuleCategory.PERFORMANCE,
                 name="执行耗时增长告警",
-                description=f"平均耗时({avg_duration:.3f}s)显著高于基线({self._baseline_avg_duration:.3f}s)",
-                condition=f"avg_duration > {self._baseline_avg_duration * 1.3:.3f}",
+                description=f"平均耗时({avg_duration:.3f}s)显著高于基线({baseline_avg_duration:.3f}s)",
+                condition=f"avg_duration > {baseline_avg_duration * 1.3:.3f}",
                 action="检查是否存在资源竞争或外部依赖延迟，考虑增加并发度",
                 priority=4,
                 confidence=0.7,
@@ -248,7 +266,7 @@ class IntelligentOptimizationAnalyzer:
         # 检查错误是否在增长
         if top_error:
             trend = self._collector.get_error_frequency_trend(top_error, window=5)
-            if len(trend) >= 2 and trend[-1] > trend[-2] * 1.5:
+            if len(trend) >= 2 and trend[-2] > 0 and trend[-1] > trend[-2] * 1.5:
                 insights.append(OptimizationInsight(
                     category=RuleCategory.ERROR_REDUCTION,
                     name=f"错误增长趋势: {top_error}",
@@ -345,29 +363,33 @@ class IntelligentOptimizationAnalyzer:
         active_rules = self._rules.get_active_rules()
         for rule in active_rules:
             # 简单效果评估：如果成功率在提升，给所有活跃规则加分
-            if self._baseline_established:
-                improvement = stats["overall_success_rate"] - self._baseline_success_rate
+            with self._lock:
+                baseline_established = self._baseline_established
+                baseline_success_rate = self._baseline_success_rate
+            if baseline_established:
+                improvement = stats["overall_success_rate"] - baseline_success_rate
                 if improvement > 0:
                     new_score = min(1.0, rule.effectiveness_score + improvement * 0.1)
                     self._rules.update_effectiveness(rule.rule_id, new_score)
 
     def _update_baseline(self, stats: Dict[str, Any]) -> None:
         """更新性能基线"""
-        if not self._baseline_established and stats["total_executions"] >= 10:
-            self._baseline_success_rate = stats["overall_success_rate"]
-            self._baseline_avg_duration = stats["avg_duration"]
-            self._baseline_established = True
-            self._log.info(
-                f"性能基线已建立: 成功率={self._baseline_success_rate:.1%}, "
-                f"平均耗时={self._baseline_avg_duration:.3f}s"
-            )
+        with self._lock:
+            if not self._baseline_established and stats["total_executions"] >= 10:
+                self._baseline_success_rate = stats["overall_success_rate"]
+                self._baseline_avg_duration = stats["avg_duration"]
+                self._baseline_established = True
+                self._log.info(
+                    f"性能基线已建立: 成功率={self._baseline_success_rate:.1%}, "
+                    f"平均耗时={self._baseline_avg_duration:.3f}s"
+                )
 
-        # 定期更新基线（每20次分析）
-        if self._baseline_established and self._analysis_count % 20 == 0:
-            self._baseline_success_rate = (
-                self._baseline_success_rate * 0.7 + stats["overall_success_rate"] * 0.3
-            )
-            self._baseline_avg_duration = (
-                self._baseline_avg_duration * 0.7 + stats["avg_duration"] * 0.3
-            )
-            self._log.debug(f"性能基线已更新: 成功率={self._baseline_success_rate:.1%}")
+            # 定期更新基线（每20次分析）
+            if self._baseline_established and self._analysis_count % 20 == 0:
+                self._baseline_success_rate = (
+                    self._baseline_success_rate * 0.7 + stats["overall_success_rate"] * 0.3
+                )
+                self._baseline_avg_duration = (
+                    self._baseline_avg_duration * 0.7 + stats["avg_duration"] * 0.3
+                )
+                self._log.debug(f"性能基线已更新: 成功率={self._baseline_success_rate:.1%}")

@@ -188,22 +188,34 @@ class OptimizationRuleRepository:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for rule_data in data.get("rules", []):
-                rule = OptimizationRule(
-                    rule_id=rule_data["rule_id"],
-                    name=rule_data.get("name", ""),
-                    description=rule_data.get("description", ""),
-                    category=RuleCategory(rule_data.get("category", "performance")),
-                    condition=rule_data.get("condition", ""),
-                    action=rule_data.get("action", ""),
-                    priority=rule_data.get("priority", 10),
-                    created_at=rule_data.get("created_at", time.time()),
-                    applied_at=rule_data.get("applied_at"),
-                    effectiveness_score=rule_data.get("effectiveness_score", 0.0),
-                    apply_count=rule_data.get("apply_count", 0),
-                    is_active=rule_data.get("is_active", True),
-                    source_cycle=rule_data.get("source_cycle", 0),
-                )
-                self._rules[rule.rule_id] = rule
+                try:
+                    # 安全地转换category，处理无效值
+                    category_str = rule_data.get("category", "performance")
+                    try:
+                        category = RuleCategory(category_str)
+                    except ValueError:
+                        self._log.warning(f"无效的规则分类: {category_str}，使用默认值performance")
+                        category = RuleCategory.PERFORMANCE
+                    
+                    rule = OptimizationRule(
+                        rule_id=rule_data["rule_id"],
+                        name=rule_data.get("name", ""),
+                        description=rule_data.get("description", ""),
+                        category=category,
+                        condition=rule_data.get("condition", ""),
+                        action=rule_data.get("action", ""),
+                        priority=rule_data.get("priority", 10),
+                        created_at=rule_data.get("created_at", time.time()),
+                        applied_at=rule_data.get("applied_at"),
+                        effectiveness_score=rule_data.get("effectiveness_score", 0.0),
+                        apply_count=rule_data.get("apply_count", 0),
+                        is_active=rule_data.get("is_active", True),
+                        source_cycle=rule_data.get("source_cycle", 0),
+                    )
+                    self._rules[rule.rule_id] = rule
+                except Exception as rule_err:
+                    self._log.warning(f"跳过无效规则数据: {rule_err}")
+                    continue
             self._log.info(f"从文件加载 {len(self._rules)} 条规则")
         except Exception as e:
             self._log.error(f"加载规则文件失败: {e}")

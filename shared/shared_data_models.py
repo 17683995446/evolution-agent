@@ -49,6 +49,23 @@ class HealthStatus(str, Enum):
     RECOVERING = "recovering"
 
 
+class RuleStatus(str, Enum):
+    """规则状态"""
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    PENDING = "pending"
+    DEPRECATED = "deprecated"
+
+
+class RecoveryStrategy(str, Enum):
+    """恢复策略"""
+    RETRY = "retry"
+    SKIP = "skip"
+    FALLBACK = "fallback"
+    RESTART_COMPONENT = "restart_component"
+    ESCALATE = "escalate"         # 上报（不自动处理）
+
+
 # ──────────────────────── 任务相关模型 ────────────────────────
 
 @dataclass
@@ -103,7 +120,7 @@ class TaskResult:
 
     @property
     def duration(self) -> float:
-        if self.started_at and self.finished_at:
+        if self.started_at is not None and self.finished_at is not None:
             return self.finished_at - self.started_at
         return self.duration_seconds
 
@@ -147,7 +164,7 @@ class CycleSummary:
 
     @property
     def duration(self) -> float:
-        end = self.finished_at or time.time()
+        end = self.finished_at if self.finished_at is not None else time.time()
         return end - self.started_at
 
 
@@ -229,3 +246,17 @@ class SystemEvent:
     timestamp: float = field(default_factory=time.time)
     data: Dict[str, Any] = field(default_factory=dict)
     cycle_number: int = 0
+
+
+@dataclass
+class ExceptionRecord:
+    """异常记录"""
+    exception_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    task_id: str = ""
+    exception_type: str = ""
+    exception_message: str = ""
+    traceback_str: str = ""
+    timestamp: float = field(default_factory=time.time)
+    recovery_strategy: RecoveryStrategy = RecoveryStrategy.RETRY
+    retry_count: int = 0
+    resolved: bool = False

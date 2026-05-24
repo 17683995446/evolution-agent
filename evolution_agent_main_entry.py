@@ -72,63 +72,69 @@ class EvolutionAgent:
         self._log = self._logging_service.get_logger("agent_main")
         self._log.info("日志服务已启动")
 
-        # 2. 异常恢复处理器
-        self._recovery_handler = ExceptionRecoveryHandler(
-            self._config.section("guardian"), self._logging_service
-        )
-        self._log.info("异常恢复处理器已初始化")
+        try:
+            # 2. 异常恢复处理器
+            self._recovery_handler = ExceptionRecoveryHandler(
+                self._config.section("guardian"), self._logging_service
+            )
+            self._log.info("异常恢复处理器已初始化")
 
-        # 3. 执行数据采集器
-        self._data_collector = ExecutionDataCollector(
-            self._config.section("storage"), self._logging_service
-        )
-        self._log.info("执行数据采集器已初始化")
+            # 3. 执行数据采集器
+            self._data_collector = ExecutionDataCollector(
+                self._config.section("storage"), self._logging_service
+            )
+            self._log.info("执行数据采集器已初始化")
 
-        # 4. 优化规则仓库
-        self._rule_repository = OptimizationRuleRepository(
-            self._config.section("optimization"), self._logging_service
-        )
-        self._log.info("优化规则仓库已初始化")
+            # 4. 优化规则仓库
+            self._rule_repository = OptimizationRuleRepository(
+                self._config.section("optimization"), self._logging_service
+            )
+            self._log.info("优化规则仓库已初始化")
 
-        # 5. 核心任务执行引擎
-        self._execution_engine = CoreTaskExecutionEngine(
-            self._config.section("execution"),
-            self._logging_service,
-            self._data_collector,
-            self._recovery_handler,
-        )
-        self._log.info("核心任务执行引擎已初始化")
+            # 5. 核心任务执行引擎
+            self._execution_engine = CoreTaskExecutionEngine(
+                self._config.section("execution"),
+                self._logging_service,
+                self._data_collector,
+                self._recovery_handler,
+            )
+            self._log.info("核心任务执行引擎已初始化")
 
-        # 6. 智能优化分析器
-        self._optimization_analyzer = IntelligentOptimizationAnalyzer(
-            self._config.section("optimization"),
-            self._logging_service,
-            self._data_collector,
-            self._rule_repository,
-            self._recovery_handler,
-        )
-        self._log.info("智能优化分析器已初始化")
+            # 6. 智能优化分析器
+            self._optimization_analyzer = IntelligentOptimizationAnalyzer(
+                self._config.section("optimization"),
+                self._logging_service,
+                self._data_collector,
+                self._rule_repository,
+                self._recovery_handler,
+            )
+            self._log.info("智能优化分析器已初始化")
 
-        # 7. 规则同步桥接器
-        self._sync_bridge = RuleSyncBridge(
-            self._logging_service,
-            self._rule_repository,
-            self._execution_engine,
-            self._optimization_analyzer,
-        )
-        self._log.info("规则同步桥接器已初始化")
+            # 7. 规则同步桥接器
+            self._sync_bridge = RuleSyncBridge(
+                self._logging_service,
+                self._rule_repository,
+                self._execution_engine,
+                self._optimization_analyzer,
+            )
+            self._log.info("规则同步桥接器已初始化")
 
-        # 8. 常驻守护管理器
-        self._guardian = ResidentGuardianManager(
-            self._config.section("guardian"),
-            self._logging_service,
-            self._recovery_handler,
-        )
-        self._register_guardian_components()
-        self._log.info("常驻守护管理器已初始化")
+            # 8. 常驻守护管理器
+            self._guardian = ResidentGuardianManager(
+                self._config.section("guardian"),
+                self._logging_service,
+                self._recovery_handler,
+            )
+            self._register_guardian_components()
+            self._log.info("常驻守护管理器已初始化")
 
-        print("  ✅ 所有模块初始化完成\n")
-        return self
+            print("  ✅ 所有模块初始化完成\n")
+            return self
+        except Exception as e:
+            if self._log is not None:
+                self._log.error(f"初始化失败: {e}")
+            self.shutdown()
+            raise
 
     # ── 运行控制 ──
 
@@ -169,23 +175,35 @@ class EvolutionAgent:
     def shutdown(self) -> None:
         """优雅关闭"""
         self._is_running = False
-        self._log.info("正在关闭Agent...")
+        if self._log is not None:
+            self._log.info("正在关闭Agent...")
 
         # 停止守护
-        self._guardian.stop_guarding()
+        if self._guardian is not None:
+            self._guardian.stop_guarding()
+
+        # 停止同步桥接器
+        if self._sync_bridge is not None:
+            self._sync_bridge.stop()
 
         # 关闭执行引擎
-        self._execution_engine.shutdown()
+        if self._execution_engine is not None:
+            self._execution_engine.shutdown()
 
         # 持久化数据
         try:
-            self._rule_repository.persist_to_file()
-            self._data_collector.persist_to_file()
-            self._log.info("数据已持久化")
+            if self._rule_repository is not None:
+                self._rule_repository.persist_to_file()
+            if self._data_collector is not None:
+                self._data_collector.persist_to_file()
+            if self._log is not None:
+                self._log.info("数据已持久化")
         except Exception as e:
-            self._log.error(f"数据持久化失败: {e}")
+            if self._log is not None:
+                self._log.error(f"数据持久化失败: {e}")
 
-        self._log.info("Agent已关闭")
+        if self._log is not None:
+            self._log.info("Agent已关闭")
 
     # ── 内部方法 ──
 
@@ -237,7 +255,7 @@ class EvolutionAgent:
                     self._rule_repository.persist_to_file()
                     self._data_collector.persist_to_file()
                 except Exception as e:
-                    self._recovery.handle_exception("agent_main", e,
+                    self._recovery_handler.handle_exception("agent_main", e,
                                                      context={"action": "persist"})
 
             # ── 打印周期报告 ──
@@ -303,7 +321,7 @@ class EvolutionAgent:
     def _check_engine_health(self) -> ComponentHealth:
         """检查执行引擎健康状态"""
         stats = self._execution_engine.get_stats()
-        error_stats = self._recovery.get_error_stats()
+        error_stats = self._recovery_handler.get_error_stats()
         engine_errors = error_stats.get("components_with_errors", {}).get("execution_engine", 0)
 
         status = HealthStatus.HEALTHY
@@ -359,7 +377,9 @@ class EvolutionAgent:
             # 重新注册处理器
             from examples.example_task_definitions import register_all_sample_handlers
             register_all_sample_handlers(self._execution_engine.handler_registry)
-            # 重新同步规则
+            # 更新同步桥的引擎引用（修复：原代码未更新，导致规则推送到旧引擎）
+            self._sync_bridge._engine = self._execution_engine
+            # 重新同步规则到新引擎
             self._sync_bridge.force_resync()
             return True
         except Exception as e:

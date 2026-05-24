@@ -11,28 +11,20 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from enum import Enum
+from collections import deque
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from shared.shared_data_models import (
     ComponentHealth,
     EventType,
     HealthStatus,
+    RecoveryStrategy as RecoveryStrategy,
     SystemEvent,
 )
 from shared.unified_logging_service import AgentLoggingService
 
 
 F = TypeVar("F", bound=Callable)
-
-
-class RecoveryStrategy(str, Enum):
-    """恢复策略"""
-    RETRY = "retry"               # 重试
-    SKIP = "skip"                 # 跳过
-    FALLBACK = "fallback"         # 降级处理
-    RESTART_COMPONENT = "restart_component"  # 重启组件
-    ESCALATE = "escalate"         # 上报（不自动处理）
 
 
 @dataclass
@@ -69,13 +61,14 @@ class ExceptionRecoveryHandler:
         self._logging_svc = logging_service
 
         # 错误记录
-        self._error_records: List[ErrorRecord] = []
+        self._error_records: deque = deque(maxlen=1000)
         self._component_error_counts: Dict[str, int] = {}
         self._lock = threading.RLock()
 
         # 恢复动作注册表
         self._recovery_actions: Dict[str, RecoveryAction] = {}
         self._component_health: Dict[str, ComponentHealth] = {}
+        self._error_id_counter = 0  # 确保error_id唯一性
 
         # 配置
         self._max_errors_before_restart = config.get(
@@ -99,7 +92,8 @@ class ExceptionRecoveryHandler:
         处理异常：尝试恢复并返回是否成功。
         仅暂停局部流程，不终止全局循环。
         """
-        error_id = f"{component}_{int(time.time() * 1000)}"
+        self._error_id_counter += 1
+        error_id = f"{component}_{int(time.time() * 1000)}_{self._error_id_counter}"
         tb_str = traceback.format_exc()
 
         self._log.error(f"[{component}] 异常捕获: {type(error).__name__}: {error}")
@@ -199,13 +193,16 @@ class ExceptionRecoveryHandler:
             health = self._component_health.get(component)
             if health:
                 health.last_check = time.time()
-                return health
+                # 返回副本防止外部修改内部状态
+                from dataclasses import replace
+                return replace(health)
             return ComponentHealth(component_name=component, status=HealthStatus.HEALTHY)
 
     def get_all_health(self) -> Dict[str, ComponentHealth]:
         """获取所有组件健康状态"""
         with self._lock:
-            return dict(self._component_health)
+            from dataclasses import replace
+            return {k: replace(v) for k, v in self._component_health.items()}
 
     def get_error_stats(self) -> Dict[str, Any]:
         """获取错误统计"""
@@ -271,17 +268,26 @@ def recovery_guard(component: str):
     def decorator(func: F) -> F:
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # 从参数中尝试获取handler实例
+            # 从参数中尝试获取handler实例（同时检查位置参数和关键字参数）
             handler = None
             for arg in args:
                 if isinstance(arg, ExceptionRecoveryHandler):
                     handler = arg
                     break
+            if handler is None:
+                for arg in kwargs.values():
+                    if isinstance(arg, ExceptionRecoveryHandler):
+                        handler = arg
+                        break
             if handler:
                 return handler.safe_execute(component, func, *args, **kwargs)
             try:
                 return func(*args, **kwargs)
-            except Exception:
+            except Exception as e:
+                import logging
+                logging.getLogger("evolution.recovery_guard").error(
+                    f"recovery_guard[{component}]: 函数 {func.__name__} 异常且无恢复处理器: {e}"
+                )
                 return None
         return wrapper  # type: ignore
     return decorator

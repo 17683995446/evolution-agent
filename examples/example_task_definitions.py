@@ -55,18 +55,41 @@ def process_data_transformation(data: Any, transform_type: str = "uppercase") ->
 
 
 def calculate_math_operations(expression: str, precision: int = 6) -> Dict[str, Any]:
-    """数学计算任务：执行数学运算"""
+    """数学计算任务：执行数学运算（安全实现，不使用eval）"""
     result = {"expression": expression}
 
     try:
         # 安全的数学表达式求值
-        allowed = set(string.digits + ".+-*/() sqrt log sin cos tan pi e ")
+        # 使用 ast 模块验证表达式安全性
+        import ast
+        
+        # 白名单字符检查
+        allowed_chars = set(string.digits + ".+-*/() ")
+        allowed_functions = {"sqrt", "log", "sin", "cos", "tan", "pi", "e"}
+        
+        # 检查是否只包含安全字符和函数名
+        test_expr = expression
+        for func in allowed_functions:
+            test_expr = test_expr.replace(func, "")
+        
+        if not all(c in allowed_chars for c in test_expr):
+            raise ValueError(f"表达式包含不允许的字符: {expression}")
+        
+        # AST 解析验证（确保只有数学运算）
+        tree = ast.parse(expression, mode='eval')
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript)):
+                raise ValueError(f"表达式包含不允许的操作: {expression}")
+        
+        # 安全求值：仅允许数学运算
         safe_expr = expression.replace("sqrt", "math.sqrt").replace("log", "math.log") \
                               .replace("sin", "math.sin").replace("cos", "math.cos") \
                               .replace("tan", "math.tan").replace("pi", "math.pi") \
                               .replace("e", "math.e")
-
-        value = eval(safe_expr, {"__builtins__": {}, "math": math})  # noqa: S307
+        
+        # 使用受限的命名空间
+        safe_globals = {"__builtins__": {}, "math": math}
+        value = eval(safe_expr, safe_globals, {})  # 限制全局和局部作用域
         result["value"] = round(value, precision)
         result["success"] = True
     except Exception as e:

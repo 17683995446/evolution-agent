@@ -47,6 +47,9 @@ class ExecutionDataCollector:
         self._total_executions = 0
         self._total_success = 0
         self._total_failures = 0
+        # 累计统计（永不因 prune 而减少，用于 get_total_stats）
+        self._cumulative_executions = 0
+        self._cumulative_success = 0
 
         # 订阅事件
         self._logging_svc.subscribe(self._on_event, filter_types=[
@@ -64,7 +67,7 @@ class ExecutionDataCollector:
             cycle_number=cycle_number,
             duration_seconds=result.duration,
             success=result.success,
-            error_type=type(result.error).__name__ if result.error else None,
+            error_type=result.error[:100] if result.error else None,  # error 现在是 str 类型，直接截取前100字符作为类型标识
             error_message=str(result.error)[:500] if result.error else None,
             resource_usage=result.metadata.get("resource_usage", {}),
             custom_metrics=result.metadata.get("custom_metrics", {}),
@@ -76,8 +79,10 @@ class ExecutionDataCollector:
 
             # 更新预计算统计
             self._total_executions += 1
+            self._cumulative_executions += 1
             if result.success:
                 self._total_success += 1
+                self._cumulative_success += 1
             else:
                 self._total_failures += 1
 
@@ -158,10 +163,13 @@ class ExecutionDataCollector:
         """获取全局统计概览（O(1)时间复杂度）"""
         with self._lock:
             return {
-                "total_executions": self._total_executions,
-                "total_success": self._total_success,
-                "total_failures": self._total_failures,
-                "overall_success_rate": self._total_success / self._total_executions if self._total_executions > 0 else 0.0,
+                "total_executions": self._cumulative_executions,
+                "total_success": self._cumulative_success,
+                "total_failures": self._cumulative_executions - self._cumulative_success,
+                "overall_success_rate": self._cumulative_success / self._cumulative_executions if self._cumulative_executions > 0 else 0.0,
+                "window_executions": self._total_executions,
+                "window_success": self._total_success,
+                "window_failures": self._total_failures,
                 "avg_duration": self.get_average_duration(),
                 "total_cycles": len(self._cycle_summaries),
                 "error_types_count": len(self._error_registry),
@@ -172,7 +180,7 @@ class ExecutionDataCollector:
 
     def prune_old_data(self, max_cycles: Optional[int] = None) -> int:
         """清理过期数据，返回清理条数"""
-        max_cyc = max_cycles or self._retention_cycles
+        max_cyc = max_cycles if max_cycles is not None else self._retention_cycles
         removed = 0
         with self._lock:
             if self._cycle_summaries:
@@ -192,7 +200,17 @@ class ExecutionDataCollector:
                 self._total_failures = self._total_executions - self._total_success
                 
                 # 同步清理其他数据
-                self._duration_history = self._duration_history[-(len(self._metrics)):]
+                if len(self._metrics) > 0:
+                    self._duration_history = self._duration_history[-len(self._metrics):]
+                else:
+                    self._duration_history = []
+                
+                # 同步清理 cycle_summaries（修复：原代码遗漏此项，导致内存持续增长）
+                original_summaries = len(self._cycle_summaries)
+                self._cycle_summaries = [
+                    s for s in self._cycle_summaries if s.cycle_number > cutoff_cycle
+                ]
+                
                 for key in list(self._error_registry.keys()):
                     self._error_registry[key] = [
                         r for r in self._error_registry[key]

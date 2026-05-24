@@ -77,6 +77,7 @@ class CoreTaskExecutionEngine:
         self._total_executed: int = 0
         self._total_success: int = 0
         self._active_rules_snapshot: List[Dict[str, Any]] = []
+        self._rules_lock = threading.Lock()  # 保护 _active_rules_snapshot 的并发访问
 
         # 并发控制
         self._max_concurrent = config.get("max_concurrent_tasks", 5)
@@ -103,7 +104,8 @@ class CoreTaskExecutionEngine:
         """提交任务到队列（线程安全，非阻塞）"""
         try:
             self._task_queue.put_nowait(task)
-            self._log.debug(f"任务入队: {task.name} (priority={task.priority.value})")
+            priority_str = task.priority.value if hasattr(task.priority, 'value') else str(task.priority)
+            self._log.debug(f"任务入队: {task.name} (priority={priority_str})")
             return True
         except queue.Full:
             self._log.warning(f"任务队列已满({self._queue_max_size})，拒绝任务: {task.name}")
@@ -152,86 +154,107 @@ class CoreTaskExecutionEngine:
             cycle_number=cycle_number,
         ))
 
-        # 取出当前周期所有任务
-        tasks_to_run = self._drain_queue()
+        try:
+            # 取出当前周期所有任务
+            tasks_to_run = self._drain_queue()
 
-        if not tasks_to_run:
-            self._log.debug(f"周期 {cycle_number}: 队列为空，快速跳过")
-            summary.finished_at = time.time()
-            self._is_running = False
-            return summary
+            if not tasks_to_run:
+                self._log.debug(f"周期 {cycle_number}: 队列为空，快速跳过")
+                summary.finished_at = time.time()
+                return summary
 
-        # 按优先级排序
-        priority_order = {
-            TaskPriority.CRITICAL: 0,
-            TaskPriority.HIGH: 1,
-            TaskPriority.NORMAL: 2,
-            TaskPriority.LOW: 3,
-        }
-        tasks_to_run.sort(key=lambda t: priority_order.get(t.priority, 2))
+            # 按优先级排序
+            priority_order = {
+                TaskPriority.CRITICAL: 0,
+                TaskPriority.HIGH: 1,
+                TaskPriority.NORMAL: 2,
+                TaskPriority.LOW: 3,
+            }
+            tasks_to_run.sort(key=lambda t: priority_order.get(t.priority, 2))
 
-        summary.total_tasks = len(tasks_to_run)
+            summary.total_tasks = len(tasks_to_run)
 
-        # 并发执行任务
-        futures: Dict[concurrent.futures.Future, TaskDefinition] = {}
-        for task in tasks_to_run:
-            future = self._executor.submit(self._execute_single_task, task, cycle_number)
-            futures[future] = task
+            # 并发执行任务
+            futures: Dict[concurrent.futures.Future, TaskDefinition] = {}
+            for task in tasks_to_run:
+                future = self._executor.submit(self._execute_single_task, task, cycle_number)
+                futures[future] = task
 
-        # 等待所有任务完成
-        for future in concurrent.futures.as_completed(futures, timeout=self._task_timeout * 2):
-            task = futures[future]
+            # 等待所有任务完成（使用 try/except 保护 as_completed 超时）
             try:
-                result = future.result(timeout=self._task_timeout)
-                if result.success:
-                    summary.completed_tasks += 1
-                    self._total_success += 1
-                else:
-                    summary.failed_tasks += 1
-                    summary.total_errors += 1
-                    if result.error:
-                        error_type = type(result.error).__name__
+                for future in concurrent.futures.as_completed(futures, timeout=self._task_timeout * 2 * max(1, len(tasks_to_run) // self._max_concurrent)):
+                    task = futures[future]
+                    try:
+                        result = future.result(timeout=self._task_timeout)
+                        if result.success:
+                            summary.completed_tasks += 1
+                            self._total_success += 1
+                        else:
+                            summary.failed_tasks += 1
+                            summary.total_errors += 1
+                            # result.error 现在是字符串类型
+                            if result.error:
+                                error_type = "TaskFailed"
+                                summary.error_types[error_type] = summary.error_types.get(error_type, 0) + 1
+                    except concurrent.futures.TimeoutError:
+                        summary.failed_tasks += 1
+                        summary.total_errors += 1
+                        summary.error_types["TimeoutError"] = summary.error_types.get("TimeoutError", 0) + 1
+                        self._log.error(f"任务超时: {task.name}")
+                    except Exception as e:
+                        summary.failed_tasks += 1
+                        summary.total_errors += 1
+                        error_type = type(e).__name__
                         summary.error_types[error_type] = summary.error_types.get(error_type, 0) + 1
+                        self._recovery.handle_exception("execution_engine", e,
+                                                         context={"task": task.name})
             except concurrent.futures.TimeoutError:
-                summary.failed_tasks += 1
-                summary.total_errors += 1
-                self._log.error(f"任务超时: {task.name}")
-            except Exception as e:
-                summary.failed_tasks += 1
-                summary.total_errors += 1
-                self._recovery.handle_exception("execution_engine", e,
-                                                 context={"task": task.name})
+                # as_completed 整体超时，统计未完成的任务为失败
+                remaining = sum(1 for f in futures if not f.done())
+                summary.failed_tasks += remaining
+                summary.total_errors += remaining
+                summary.error_types["BatchTimeout"] = summary.error_types.get("BatchTimeout", 0) + remaining
+                self._log.error(f"周期 {cycle_number}: 批量执行超时，{remaining} 个任务未完成")
 
-        # 计算统计
-        durations = [r.duration_seconds for r in self._collector.get_recent_metrics(len(tasks_to_run))]
-        summary.avg_duration = sum(durations) / len(durations) if durations else 0.0
-        summary.finished_at = time.time()
-        self._total_executed += summary.total_tasks
+            # 计算统计
+            durations = [r.duration_seconds for r in self._collector.get_recent_metrics(len(tasks_to_run))]
+            summary.avg_duration = sum(durations) / len(durations) if durations else 0.0
+            summary.finished_at = time.time()
+            self._total_executed += summary.total_tasks
 
-        self._log.info(
-            f"═══ 执行周期 {cycle_number} 完成 ═══ "
-            f"总计={summary.total_tasks}, 成功={summary.completed_tasks}, "
-            f"失败={summary.failed_tasks}, 成功率={summary.success_rate:.1%}, "
-            f"平均耗时={summary.avg_duration:.3f}s"
-        )
+            self._log.info(
+                f"═══ 执行周期 {cycle_number} 完成 ═══ "
+                f"总计={summary.total_tasks}, 成功={summary.completed_tasks}, "
+                f"失败={summary.failed_tasks}, 成功率={summary.success_rate:.1%}, "
+                f"平均耗时={summary.avg_duration:.3f}s"
+            )
 
-        self._logging_svc.emit_event(SystemEvent(
-            event_type=EventType.CYCLE_COMPLETED,
-            source="execution_engine",
-            data={"cycle_summary": summary},
-            cycle_number=cycle_number,
-        ))
+            self._logging_svc.emit_event(SystemEvent(
+                event_type=EventType.CYCLE_COMPLETED,
+                source="execution_engine",
+                data={"cycle_summary": summary},
+                cycle_number=cycle_number,
+            ))
 
-        self._is_running = False
+        except Exception as e:
+            self._log.error(f"执行周期 {cycle_number} 发生未预期异常: {e}")
+            summary.finished_at = time.time()
+            self._recovery.handle_exception("execution_engine", e,
+                                             context={"cycle": cycle_number})
+        finally:
+            self._is_running = False
         return summary
 
     def apply_optimization_rules(self, rules: List[Dict[str, Any]]) -> None:
         """接收并应用优化规则（由同步桥接器调用）"""
-        self._active_rules_snapshot = rules
+        with self._rules_lock:
+            self._active_rules_snapshot = list(rules)  # 创建副本，避免外部修改
         self._log.info(f"已加载 {len(rules)} 条优化规则到执行引擎")
 
     def get_stats(self) -> Dict[str, Any]:
         """获取引擎统计"""
+        with self._rules_lock:
+            active_rules = len(self._active_rules_snapshot)
         return {
             "current_cycle": self._current_cycle,
             "is_running": self._is_running,
@@ -242,7 +265,7 @@ class CoreTaskExecutionEngine:
                 if self._total_executed > 0 else 0.0
             ),
             "queue_size": self.queue_size(),
-            "active_rules_count": len(self._active_rules_snapshot),
+            "active_rules_count": active_rules,
             "registered_handlers": self.handler_registry.list_handlers(),
         }
 
@@ -278,7 +301,9 @@ class CoreTaskExecutionEngine:
 
         result.started_at = time.time()
 
-        for attempt in range(task.max_retries + 1):
+        max_retries = max(0, task.max_retries)
+
+        for attempt in range(max_retries + 1):
             try:
                 result.status = TaskStatus.RUNNING
                 if attempt > 0:
@@ -308,7 +333,8 @@ class CoreTaskExecutionEngine:
                 result.finished_at = time.time()
                 result.duration_seconds = result.duration
 
-                self._recovery.reset_component_errors("execution_engine")
+                # 不再每次成功后清零错误计数，让守护管理器基于自己的
+                # consecutive_failures 判断是否需要重启
                 self._collector.record_task_execution(result, cycle_number)
 
                 self._logging_svc.emit_event(SystemEvent(
@@ -325,11 +351,11 @@ class CoreTaskExecutionEngine:
                 return result
 
             except Exception as e:
-                result.error = e
+                result.error = str(e)
                 result.finished_at = time.time()
                 result.duration_seconds = result.duration
 
-                if attempt == task.max_retries:
+                if attempt == max_retries:
                     result.status = TaskStatus.FAILED
                     self._log.error(f"任务 {task.name} 最终失败: {e}")
                     self._recovery.handle_exception(
@@ -355,8 +381,11 @@ class CoreTaskExecutionEngine:
     def _apply_rules_preprocessing(self, task: TaskDefinition,
                                     result: TaskResult) -> Dict[str, Any]:
         """根据活跃的优化规则对任务参数进行预处理"""
-        params = dict(task.handler_params)
-        for rule in self._active_rules_snapshot:
+        internal_keys = {'_optimized_timeout', '_parallel_hint'}
+        params = dict(task.handler_params) if task.handler_params else {}
+        with self._rules_lock:
+            rules_snapshot = list(self._active_rules_snapshot)
+        for rule in rules_snapshot:
             try:
                 # 规则可以修改任务参数
                 action = rule.get("action", "")
@@ -364,6 +393,7 @@ class CoreTaskExecutionEngine:
                     params["_optimized_timeout"] = True
                 if "parallel" in action.lower():
                     params["_parallel_hint"] = True
-            except Exception:
-                pass
+            except Exception as e:
+                self._log.warning(f"规则预处理异常（规则: {rule.get('name', 'unknown')}）: {e}")
+        params = {k: v for k, v in params.items() if k not in internal_keys}
         return params

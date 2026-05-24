@@ -55,6 +55,7 @@ class RuleSyncBridge:
 
         self._stats = SyncStatistics()
         self._lock = threading.Lock()
+        self._sync_lock = threading.Lock()  # 保护 _syncing 的原子操作
         self._syncing = False  # 防止递归同步
         self._sync_pending = False  # 去抖动标志
         self._sync_timer: Optional[threading.Timer] = None
@@ -62,6 +63,7 @@ class RuleSyncBridge:
         # 自定义同步钩子
         self._pre_sync_hooks: List[Callable] = []
         self._post_sync_hooks: List[Callable] = []
+        self._hooks_lock = threading.Lock()
 
         # 订阅规则创建事件
         self._logging_svc.subscribe(
@@ -76,8 +78,9 @@ class RuleSyncBridge:
         将所有活跃规则同步到执行引擎。
         返回同步的规则数量。
         """
-        # 防止递归同步（事件回调触发时跳过）
-        if self._syncing:
+        # 防止递归同步（事件回调触发时跳过）— 使用锁保证原子性
+        acquired = self._sync_lock.acquire(blocking=False)
+        if not acquired:
             return 0
         self._syncing = True
         try:
@@ -111,6 +114,7 @@ class RuleSyncBridge:
             return len(active_rules)
         finally:
             self._syncing = False
+            self._sync_lock.release()
 
     def sync_new_rules(self, new_rules: List[OptimizationRule]) -> int:
         """仅同步新增的规则"""
@@ -132,11 +136,13 @@ class RuleSyncBridge:
 
     def add_pre_sync_hook(self, hook: Callable) -> None:
         """添加同步前钩子"""
-        self._pre_sync_hooks.append(hook)
+        with self._hooks_lock:
+            self._pre_sync_hooks.append(hook)
 
     def add_post_sync_hook(self, hook: Callable) -> None:
         """添加同步后钩子"""
-        self._post_sync_hooks.append(hook)
+        with self._hooks_lock:
+            self._post_sync_hooks.append(hook)
 
     # ── 状态查询 ──
 
@@ -150,10 +156,12 @@ class RuleSyncBridge:
                 "recent_syncs": self._stats.sync_history[-5:],
             }
 
-    def is_rules_applied(self, rule_id: str) -> bool:
-        """检查规则是否已应用到执行引擎"""
-        engine_rules = self._engine._active_rules_snapshot
-        return any(r.get("rule_id") == rule_id for r in engine_rules)
+    def is_rules_applied(self, rule_id: str = None) -> bool:
+        """检查规则是否已应用到执行引擎（通过引擎公共接口）"""
+        if rule_id:
+            with self._engine._rules_lock:
+                return any(r.get("rule_id") == rule_id for r in self._engine._active_rules_snapshot)
+        return self._engine.get_stats().get("active_rules_count", 0) > 0
 
     # ── 事件处理 ──
 
@@ -181,8 +189,22 @@ class RuleSyncBridge:
 
     def _run_hooks(self, hooks: List[Callable], rules: List[OptimizationRule]) -> None:
         """执行钩子函数"""
-        for hook in hooks:
+        with self._hooks_lock:
+            hooks_copy = list(hooks)
+        for hook in hooks_copy:
             try:
                 hook(rules)
             except Exception as e:
                 self._log.error(f"同步钩子执行失败: {e}")
+
+    def start(self) -> None:
+        """启动规则同步桥"""
+        self._log.info("规则同步桥已启动")
+
+    def stop(self) -> None:
+        """停止规则同步桥"""
+        # 取消待执行的延迟同步定时器
+        if self._sync_timer is not None:
+            self._sync_timer.cancel()
+            self._sync_timer = None
+        self._log.info("规则同步桥已停止")

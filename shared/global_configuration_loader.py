@@ -68,7 +68,7 @@ class AgentConfig:
 
     def __init__(self, config_dict: Optional[Dict[str, Any]] = None):
         self._config: Dict[str, Any] = json.loads(json.dumps(DEFAULT_CONFIG))
-        if config_dict:
+        if config_dict and isinstance(config_dict, dict):
             self._deep_merge(self._config, config_dict)
         self._apply_env_overrides()
 
@@ -126,8 +126,11 @@ class AgentConfig:
         path = Path(file_path)
         if not path.exists():
             return cls()
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            data = {}
         return cls(data)
 
     # ── 内部方法 ──
@@ -135,6 +138,8 @@ class AgentConfig:
     def _deep_merge(self, base: Dict, override: Dict) -> None:
         """递归合并字典，override覆盖base"""
         for key, value in override.items():
+            if value is None:
+                continue
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
                 self._deep_merge(base[key], value)
             else:
@@ -159,10 +164,7 @@ class AgentConfig:
     @staticmethod
     def _parse_env_value(value: str) -> Any:
         """智能解析环境变量值类型"""
-        if value.lower() in ("true", "yes", "1"):
-            return True
-        if value.lower() in ("false", "no", "0"):
-            return False
+        # 先尝试数字类型（避免 "0"/"1" 被错误解析为布尔值）
         try:
             return int(value)
         except ValueError:
@@ -171,6 +173,11 @@ class AgentConfig:
             return float(value)
         except ValueError:
             pass
+        # 再尝试布尔类型
+        if value.lower() in ("true", "yes"):
+            return True
+        if value.lower() in ("false", "no"):
+            return False
         return value
 
     def __repr__(self) -> str:

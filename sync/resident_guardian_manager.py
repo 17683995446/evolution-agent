@@ -107,11 +107,11 @@ class ResidentGuardianManager:
 
     def start_guarding(self) -> None:
         """启动守护线程"""
-        if self._is_guarding:
-            self._log.warning("守护线程已在运行")
-            return
-
-        self._is_guarding = True
+        with self._lock:
+            if self._is_guarding:
+                self._log.warning("守护线程已在运行")
+                return
+            self._is_guarding = True
         self._stop_event.clear()
         self._guardian_start_time = time.time()
         self._guardian_thread = threading.Thread(
@@ -142,17 +142,19 @@ class ResidentGuardianManager:
             try:
                 health = item.health_check()
                 health.last_check = time.time()
-                item.last_health = health
+                with self._lock:
+                    item.last_health = health
+                    # 状态变化处理
+                    if health.status == HealthStatus.HEALTHY:
+                        item.consecutive_failures = 0
+                    elif health.status in (HealthStatus.DEGRADED, HealthStatus.UNHEALTHY):
+                        item.consecutive_failures += 1
                 results[item.name] = health
 
-                # 状态变化处理
                 if health.status == HealthStatus.HEALTHY:
-                    item.consecutive_failures = 0
                     self._recovery.reset_component_errors(item.name)
 
                 elif health.status in (HealthStatus.DEGRADED, HealthStatus.UNHEALTHY):
-                    item.consecutive_failures += 1
-
                     # 发送健康检查事件
                     self._logging_svc.emit_event(SystemEvent(
                         event_type=EventType.SYSTEM_HEALTH_CHECK,
@@ -165,9 +167,12 @@ class ResidentGuardianManager:
                     ))
 
                     # 自动重启判定
+                    with self._lock:
+                        failures = item.consecutive_failures
+                        has_restart = item.restart_action is not None
                     if (self._auto_restart
-                            and item.restart_action
-                            and item.consecutive_failures >= self._max_errors):
+                            and has_restart
+                            and failures >= self._max_errors):
                         self._restart_component(item)
 
             except Exception as e:
@@ -180,12 +185,20 @@ class ResidentGuardianManager:
                     last_error=str(e)[:200],
                 )
 
-        self._total_health_checks += 1
+        with self._lock:
+            self._total_health_checks += 1
         return results
 
     def get_system_health(self) -> Dict[str, Any]:
-        """获取系统整体健康状态"""
-        health_results = self.check_all_components()
+        """获取系统整体健康状态（只读查询，不触发重启）"""
+        # 直接读取组件当前状态，不调用 check_all_components 避免副作用
+        health_results = {}
+        with self._lock:
+            for name, item in self._watch_items.items():
+                if item.last_health:
+                    health_results[name] = item.last_health
+                else:
+                    health_results[name] = ComponentHealth(component_name=name)
 
         healthy = sum(1 for h in health_results.values() if h.status == HealthStatus.HEALTHY)
         total = len(health_results)
@@ -249,11 +262,11 @@ class ResidentGuardianManager:
 
         try:
             success = item.restart_action()
-            item.last_restart_time = time.time()
-            self._total_restarts += 1
-
             if success:
-                item.consecutive_failures = 0
+                with self._lock:
+                    item.consecutive_failures = 0
+                    item.last_restart_time = time.time()
+                    self._total_restarts += 1
                 self._log.info(f"组件 {item.name} 重启成功")
                 self._logging_svc.emit_event(SystemEvent(
                     event_type=EventType.COMPONENT_RECOVERED,
@@ -269,3 +282,11 @@ class ResidentGuardianManager:
             self._recovery.handle_exception("guardian_manager", e,
                                              context={"component": item.name, "action": "restart"})
             return False
+
+    def start(self) -> None:
+        """启动守护管理器（调用 start_guarding）"""
+        self.start_guarding()
+
+    def stop(self) -> None:
+        """停止守护管理器（调用 stop_guarding）"""
+        self.stop_guarding()

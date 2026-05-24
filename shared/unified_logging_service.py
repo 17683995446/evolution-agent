@@ -9,6 +9,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -30,8 +31,12 @@ class ColoredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         color = self.COLORS.get(record.levelname, self.RESET)
+        # 保存原始 levelname，格式化后恢复，避免影响其他处理器
+        original_levelname = record.levelname
         record.levelname = f"{color}{record.levelname}{self.RESET}"
-        return super().format(record)
+        result = super().format(record)
+        record.levelname = original_levelname
+        return result
 
 
 class EventCallback:
@@ -56,6 +61,7 @@ class AgentLoggingService:
         self._event_callbacks: List[EventCallback] = []
         self._event_history: List[SystemEvent] = []
         self._max_history = 1000
+        self._event_lock = threading.Lock()
         self._setup_root_logger()
 
     # ── 日志接口 ──
@@ -88,11 +94,13 @@ class AgentLoggingService:
 
     def emit_event(self, event: SystemEvent) -> None:
         """发布系统事件"""
-        self._event_history.append(event)
-        if len(self._event_history) > self._max_history:
-            self._event_history = self._event_history[-self._max_history:]
+        with self._event_lock:
+            self._event_history.append(event)
+            if len(self._event_history) > self._max_history:
+                self._event_history = self._event_history[-self._max_history:]
 
-        for callback in self._event_callbacks:
+        # 迭代前复制列表，防止回调中修改列表引发 RuntimeError
+        for callback in list(self._event_callbacks):
             if callback.should_handle(event):
                 try:
                     callback.callback(event)
@@ -101,21 +109,26 @@ class AgentLoggingService:
 
     def subscribe(self, callback: Callable, filter_types: Optional[List[EventType]] = None) -> None:
         """订阅系统事件"""
-        self._event_callbacks.append(EventCallback(callback, filter_types))
+        with self._event_lock:
+            self._event_callbacks.append(EventCallback(callback, filter_types))
 
     def unsubscribe(self, callback: Callable) -> None:
         """取消订阅"""
-        self._event_callbacks = [
-            cb for cb in self._event_callbacks if cb.callback != callback
-        ]
+        with self._event_lock:
+            self._event_callbacks = [
+                cb for cb in self._event_callbacks if cb.callback != callback
+            ]
 
     def get_recent_events(self, count: int = 50) -> List[SystemEvent]:
         """获取最近的事件记录"""
-        return self._event_history[-count:]
+        with self._event_lock:
+            count = max(1, min(count, len(self._event_history)))
+            return self._event_history[-count:]
 
     def get_events_by_type(self, event_type: EventType) -> List[SystemEvent]:
         """按类型筛选事件"""
-        return [e for e in self._event_history if e.event_type == event_type]
+        with self._event_lock:
+            return [e for e in self._event_history if e.event_type == event_type]
 
     # ── 性能追踪 ──
 
